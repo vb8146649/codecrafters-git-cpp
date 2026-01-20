@@ -52,8 +52,8 @@ To make this easier to type out, you could add a
 [shell alias](https://shapeshed.com/unix-alias/):
 
 ```sh
-alias mygit=/path/to/your/repo/your_program.sh
+alias mygit=/home/asus/Desktop/DTU/SEM VI/codecrafters-git-cpp/your_program.sh
 
-mkdir -p /tmp/testing && cd /tmp/testing
+mkdir -p ./tmp/testing && cd ./tmp/testing
 mygit init
 ```
