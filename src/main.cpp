@@ -4,6 +4,9 @@
 #include <string>
 #include <vector>
 #include <zlib.h> // Required for decompression
+#include <openssl/sha.h> // Required for SHA1
+#include <sstream>
+#include <iomanip>
 
 using namespace std;
 
@@ -117,6 +120,69 @@ int main(int argc, char *argv[])
         string content = decompressed.substr(nullPos + 1);
         cout << content;
 
+    } else if (command == "hash-object") {
+        if (argc < 4 || string(argv[2]) != "-w") {
+            cerr << "Usage: hash-object -w <file_path>\n";
+            return EXIT_FAILURE;
+        }
+
+        string file_path = argv[3];
+        
+        // Read file content
+        ifstream file(file_path, ios::binary);
+        if (!file.is_open()) {
+            cerr << "Failed to open file: " << file_path << endl;
+            return EXIT_FAILURE;
+        }
+        
+        vector<char> fileData((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
+        file.close();
+
+        // Create blob header
+        string header = "blob " + to_string(fileData.size()) + '\0';
+        // Full data to hash
+        string fullData = header + string(fileData.begin(), fileData.end());
+
+        // Compute SHA-1 hash
+        unsigned char hash[20];
+        SHA1(reinterpret_cast<const unsigned char*>(fullData.data()), fullData.size(), hash);
+
+        // Convert hash to hex string
+        stringstream ss;
+        for (int i = 0; i < 20; ++i) {
+            ss << hex << setw(2) << setfill('0') << (int)hash[i];
+        }
+        string sha1 = ss.str();
+
+        // Compress the data using zlib
+        uLongf compressedSize = compressBound(fullData.size());
+        vector<Bytef> compressedData(compressedSize);
+
+        if (compress(compressedData.data(), &compressedSize, reinterpret_cast<const Bytef*>(fullData.data()), fullData.size()) != Z_OK) {
+            cerr << "Compression failed." << endl;
+            return EXIT_FAILURE;
+        }
+
+        // Store the object in .git/objects/xx/yyyyyyyy...
+        string dirName = sha1.substr(0, 2);
+        string fileName = sha1.substr(2);
+        filesystem::path objectDir = ".git/objects/" + dirName;
+
+        // Create directory if it doesn't exist
+        filesystem::create_directories(objectDir);
+
+        filesystem::path objectPath = objectDir / fileName;
+        ofstream objectFile(objectPath, ios::binary);
+        if (!objectFile.is_open()) {
+            cerr << "Failed to create object file." << endl;
+            return EXIT_FAILURE;
+        }
+
+        objectFile.write(reinterpret_cast<const char*>(compressedData.data()), compressedSize);
+        objectFile.close();
+
+        // Output the SHA-1 hash
+        cout << sha1 << endl;
     } else {
         cerr << "Unknown command " << command << '\n';
         return EXIT_FAILURE;
