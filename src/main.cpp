@@ -7,38 +7,78 @@
 #include <openssl/sha.h>
 #include <sstream>
 #include <iomanip>
-#include <algorithm> // for find
+#include <algorithm> // Required for sorting
 
 using namespace std;
+namespace fs = std::filesystem;
 
-// Helper: Decompress a git object from .git/objects given its SHA
+// --- Helper Functions ---
+
+// Convert raw 20-byte SHA string to 40-char Hex string
+string shaToHex(const string& rawSha) {
+    stringstream ss;
+    for (unsigned char c : rawSha) {
+        ss << hex << setw(2) << setfill('0') << (int)c;
+    }
+    return ss.str();
+}
+
+// Write a git object (Blob or Tree) to .git/objects
+// Returns the raw 20-byte SHA-1
+string writeObject(const string& type, const string& content) {
+    // 1. Prepare Header: "type <size>\0"
+    string header = type + " " + to_string(content.size()) + '\0';
+    string store = header + content;
+
+    // 2. Compute SHA-1
+    unsigned char hash[20];
+    SHA1(reinterpret_cast<const unsigned char*>(store.data()), store.size(), hash);
+    string sha1Raw((char*)hash, 20);
+    string sha1Hex = shaToHex(sha1Raw);
+
+    // 3. Compress using Zlib
+    uLongf compressedSize = compressBound(store.size());
+    vector<Bytef> compressedData(compressedSize);
+    if (compress(compressedData.data(), &compressedSize, reinterpret_cast<const Bytef*>(store.data()), store.size()) != Z_OK) {
+        throw runtime_error("Compression failed");
+    }
+
+    // 4. Write to Disk
+    string dirName = sha1Hex.substr(0, 2);
+    string fileName = sha1Hex.substr(2);
+    fs::path dirPath = ".git/objects/" + dirName;
+    
+    if (!fs::exists(dirPath)) {
+        fs::create_directories(dirPath);
+    }
+
+    ofstream outFile(dirPath / fileName, ios::binary);
+    if (!outFile.is_open()) throw runtime_error("Failed to write object file");
+    outFile.write(reinterpret_cast<const char*>(compressedData.data()), compressedSize);
+    outFile.close();
+
+    return sha1Raw;
+}
+
+// Read and decompress an object (used by cat-file and ls-tree)
 string readObject(const string& sha) {
     string dirName = sha.substr(0, 2);
     string fileName = sha.substr(2);
-    filesystem::path filePath = ".git/objects/" + dirName + "/" + fileName;
+    fs::path filePath = ".git/objects/" + dirName + "/" + fileName;
 
-    if (!filesystem::exists(filePath)) {
-        throw runtime_error("Object not found: " + sha);
-    }
+    if (!fs::exists(filePath)) throw runtime_error("Object not found: " + sha);
 
     ifstream file(filePath, ios::binary);
-    if (!file.is_open()) {
-        throw runtime_error("Failed to open object file: " + sha);
-    }
+    if (!file.is_open()) throw runtime_error("Failed to open object file");
 
-    vector<char> compressedData((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
+    vector<char> compressed((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
     file.close();
 
-    z_stream zs;
-    zs.zalloc = Z_NULL;
-    zs.zfree = Z_NULL;
-    zs.opaque = Z_NULL;
-    zs.avail_in = compressedData.size();
-    zs.next_in = reinterpret_cast<Bytef*>(compressedData.data());
+    z_stream zs = {0}; // Zero-init
+    if (inflateInit(&zs) != Z_OK) throw runtime_error("Failed to initialize zlib");
 
-    if (inflateInit(&zs) != Z_OK) {
-        throw runtime_error("Failed to initialize zlib.");
-    }
+    zs.avail_in = compressed.size();
+    zs.next_in = reinterpret_cast<Bytef*>(compressed.data());
 
     vector<char> buffer(8192);
     string decompressed;
@@ -47,18 +87,73 @@ string readObject(const string& sha) {
     do {
         zs.avail_out = buffer.size();
         zs.next_out = reinterpret_cast<Bytef*>(buffer.data());
-
         ret = inflate(&zs, Z_NO_FLUSH);
-
         if (decompressed.size() < zs.total_out) {
             decompressed.append(buffer.data(), zs.total_out - decompressed.size());
         }
-
     } while (ret != Z_STREAM_END);
-
+    
     inflateEnd(&zs);
     return decompressed;
 }
+
+// Struct to hold tree entries for sorting
+struct TreeEntry {
+    string name;
+    string mode;     // "100644" or "40000"
+    string shaRaw;   // 20-byte raw SHA
+
+    // Sorting operator required by Git (sort by name)
+    bool operator<(const TreeEntry& other) const {
+        return name < other.name;
+    }
+};
+
+// Recursive function to build trees
+string writeTree(const fs::path& directory) {
+    vector<TreeEntry> entries;
+
+    for (const auto& entry : fs::directory_iterator(directory)) {
+        string name = entry.path().filename().string();
+        
+        // Ignore .git directory
+        if (name == ".git") continue;
+
+        TreeEntry te;
+        te.name = name;
+
+        if (entry.is_directory()) {
+            te.mode = "40000";
+            // Recursively write the subdirectory tree
+            te.shaRaw = writeTree(entry.path());
+        } else {
+            te.mode = "100644"; // Assuming regular file
+            
+            // Read file content
+            ifstream file(entry.path(), ios::binary);
+            string content((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
+            
+            // Write blob and get SHA
+            te.shaRaw = writeObject("blob", content);
+        }
+        entries.push_back(te);
+    }
+
+    // Sort entries alphabetically
+    sort(entries.begin(), entries.end());
+
+    // Construct the Tree Object content
+    string treeContent;
+    for (const auto& e : entries) {
+        // Format: <mode> <name>\0<20_byte_sha>
+        treeContent += e.mode + " " + e.name + '\0' + e.shaRaw;
+    }
+
+    // Write the tree object itself
+    return writeObject("tree", treeContent);
+}
+
+// --- Main ---
 
 int main(int argc, char *argv[])
 {
@@ -72,126 +167,52 @@ int main(int argc, char *argv[])
     
     string command = argv[1];
     
-    if (command == "init") {
-        try {
-            filesystem::create_directory(".git");
-            filesystem::create_directory(".git/objects");
-            filesystem::create_directory(".git/refs");
-    
+    try {
+        if (command == "init") {
+            fs::create_directories(".git/objects");
+            fs::create_directories(".git/refs");
             ofstream headFile(".git/HEAD");
             if (headFile.is_open()) {
                 headFile << "ref: refs/heads/main\n";
                 headFile.close();
-            } else {
-                cerr << "Failed to create .git/HEAD file.\n";
-                return EXIT_FAILURE;
             }
-    
             cout << "Initialized git directory\n";
-        } catch (const filesystem::filesystem_error& e) {
-            cerr << e.what() << '\n';
-            return EXIT_FAILURE;
-        }
-    } else if (command == "cat-file") {
-        if (argc < 4 || string(argv[2]) != "-p") {
-            cerr << "Usage: cat-file -p <blob_sha>\n";
-            return EXIT_FAILURE;
-        }
 
-        try {
+        } else if (command == "cat-file") {
+            if (argc < 4 || string(argv[2]) != "-p") return EXIT_FAILURE;
             string content = readObject(argv[3]);
-            // Find null byte separating header from content
             size_t nullPos = content.find('\0');
-            if (nullPos == string::npos) {
-                cerr << "Invalid object format." << endl;
-                return EXIT_FAILURE;
-            }
             cout << content.substr(nullPos + 1);
-        } catch (const exception& e) {
-            cerr << e.what() << endl;
-            return EXIT_FAILURE;
-        }
 
-    } else if (command == "hash-object") {
-        // ... (Your hash-object code remains exactly the same) ...
-        if (argc < 4 || string(argv[2]) != "-w") {
-            cerr << "Usage: hash-object -w <file_path>\n";
-            return EXIT_FAILURE;
-        }
-        string file_path = argv[3];
-        ifstream file(file_path, ios::binary);
-        if (!file.is_open()) { cerr << "Failed to open file." << endl; return EXIT_FAILURE; }
-        vector<char> fileData((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
-        file.close();
+        } else if (command == "hash-object") {
+            if (argc < 4 || string(argv[2]) != "-w") return EXIT_FAILURE;
+            ifstream file(argv[3], ios::binary);
+            string content((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
+            string rawSha = writeObject("blob", content);
+            cout << shaToHex(rawSha) << endl;
 
-        string header = "blob " + to_string(fileData.size()) + '\0';
-        string fullData = header + string(fileData.begin(), fileData.end());
-
-        unsigned char hash[20];
-        SHA1(reinterpret_cast<const unsigned char*>(fullData.data()), fullData.size(), hash);
-
-        stringstream ss;
-        for (int i = 0; i < 20; ++i) ss << hex << setw(2) << setfill('0') << (int)hash[i];
-        string sha1 = ss.str();
-
-        uLongf compressedSize = compressBound(fullData.size());
-        vector<Bytef> compressedData(compressedSize);
-        if (compress(compressedData.data(), &compressedSize, reinterpret_cast<const Bytef*>(fullData.data()), fullData.size()) != Z_OK) {
-             cerr << "Compression failed." << endl; return EXIT_FAILURE; 
-        }
-
-        string dirName = sha1.substr(0, 2);
-        string fileName = sha1.substr(2);
-        filesystem::create_directories(".git/objects/" + dirName);
-        ofstream objectFile(".git/objects/" + dirName + "/" + fileName, ios::binary);
-        objectFile.write(reinterpret_cast<const char*>(compressedData.data()), compressedSize);
-        objectFile.close();
-        cout << sha1 << endl;
-
-    } else if (command == "ls-tree") {
-        if (argc < 4 || string(argv[2]) != "--name-only") {
-            cerr << "Usage: ls-tree --name-only <tree_sha>\n";
-            return EXIT_FAILURE;
-        }
-
-        string tree_sha = argv[3];
-        try {
-            string content = readObject(tree_sha);
-            
-            // 1. Skip the header "tree <size>\0"
-            size_t headerEnd = content.find('\0');
-            if (headerEnd == string::npos) return EXIT_FAILURE;
-            
-            // i points to the start of the first entry
-            size_t i = headerEnd + 1; 
-
-            // Loop until we run out of data
+        } else if (command == "ls-tree") {
+            if (argc < 4 || string(argv[2]) != "--name-only") return EXIT_FAILURE;
+            string content = readObject(argv[3]);
+            size_t i = content.find('\0') + 1; // Skip header
             while (i < content.size()) {
-                // Format: <mode> <name>\0<20_byte_sha>
-                
-                // 2. Find the space after mode (we ignore mode for now)
                 size_t spacePos = content.find(' ', i);
-                if (spacePos == string::npos) break;
-
-                // 3. Find the null byte after name
                 size_t nullPos = content.find('\0', spacePos);
-                if (nullPos == string::npos) break;
-
-                // Extract name
-                string name = content.substr(spacePos + 1, nullPos - (spacePos + 1));
-                cout << name << endl;
-
-                // 4. Advance past the null byte AND the 20-byte SHA
-                // The SHA is exactly 20 bytes long
-                i = nullPos + 1 + 20;
+                cout << content.substr(spacePos + 1, nullPos - (spacePos + 1)) << endl;
+                i = nullPos + 1 + 20; // Skip SHA
             }
-        } catch (const exception& e) {
-            cerr << e.what() << endl;
+
+        } else if (command == "write-tree") {
+            // Write tree of current directory "."
+            string rawSha = writeTree(".");
+            cout << shaToHex(rawSha) << endl;
+
+        } else {
+            cerr << "Unknown command " << command << '\n';
             return EXIT_FAILURE;
         }
-
-    } else {
-        cerr << "Unknown command " << command << '\n';
+    } catch (const exception& e) {
+        cerr << e.what() << endl;
         return EXIT_FAILURE;
     }
     
