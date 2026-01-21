@@ -23,7 +23,7 @@ string shaToHex(const string& rawSha) {
     return ss.str();
 }
 
-// Write a git object (Blob or Tree) to .git/objects
+// Write a git object (Blob or Tree or Commit) to .git/objects
 // Returns the raw 20-byte SHA-1
 string writeObject(const string& type, const string& content) {
     // 1. Prepare Header: "type <size>\0"
@@ -205,6 +205,54 @@ int main(int argc, char *argv[])
         } else if (command == "write-tree") {
             // Write tree of current directory "."
             string rawSha = writeTree(".");
+            cout << shaToHex(rawSha) << endl;
+
+        } else if (command == "commit-tree") {
+            // Usage: commit-tree <tree_sha> -p <parent_sha> -m <message>
+            // Note: -p <parent_sha> is optional or variable position
+            
+            if (argc < 4) {
+                cerr << "Usage: commit-tree <tree_sha> -m <message> [-p <parent_sha>]\n";
+                return EXIT_FAILURE;
+            }
+
+            string tree_sha = argv[2];
+            string parent_sha;
+            string message;
+
+            // Simple argument parsing loop to handle flags (-p, -m)
+            for (int i = 3; i < argc; ++i) {
+                string arg = argv[i];
+                if (arg == "-p" && i + 1 < argc) {
+                    parent_sha = argv[++i];
+                } else if (arg == "-m" && i + 1 < argc) {
+                    message = argv[++i];
+                }
+            }
+
+            stringstream ss;
+            // 1. Tree SHA
+            ss << "tree " << tree_sha << "\n";
+            
+            // 2. Parent SHA (if present)
+            if (!parent_sha.empty()) {
+                ss << "parent " << parent_sha << "\n";
+            }
+            
+            // 3. Author & Committer
+            // Hardcoded as permitted by the challenge requirements
+            string authorLine = "author Code Crafter <code@crafters.io> 1700000000 +0000";
+            string committerLine = "committer Code Crafter <code@crafters.io> 1700000000 +0000";
+
+            ss << authorLine << "\n";
+            ss << committerLine << "\n";
+            ss << "\n"; // Blank line is required between header and message
+            
+            // 4. Message
+            ss << message << "\n";
+
+            // Write the commit object using the generic helper
+            string rawSha = writeObject("commit", ss.str());
             cout << shaToHex(rawSha) << endl;
 
         } else {
