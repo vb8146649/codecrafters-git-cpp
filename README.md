@@ -1,59 +1,98 @@
-[![progress-banner](https://backend.codecrafters.io/progress/git/e8fa5e6d-f88e-4948-af88-67de20904adc)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
+# Build Your Own Git (C++)
 
-This is a starting point for C++ solutions to the
-["Build Your Own Git" Challenge](https://codecrafters.io/challenges/git).
+A robust, from-scratch implementation of Git written in C++. This project creates a functional Git client capable of reading low-level Git objects, creating commits, and even cloning repositories from remote servers using the Git Smart HTTP protocol.
 
-In this challenge, you'll build a small Git implementation that's capable of
-initializing a repository, creating commits and cloning a public repository.
-Along the way we'll learn about the `.git` directory, Git objects (blobs,
-commits, trees etc.), Git's transfer protocols and more.
+Built as part of the [CodeCrafters](https://codecrafters.io) "Build Your Own Git" challenge.
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+## 🚀 Features
 
-# Passing the first stage
+This client implements the core "plumbing" commands of Git:
 
-The entry point for your Git implementation is in `src/main.cpp`. Study and
-uncomment the relevant code, and push your changes to pass the first stage:
+* **`init`**: Initializes a new `.git` directory structure.
+* **`cat-file -p <sha>`**: Reads and decompresses Git objects (blobs) and prints their content.
+* **`hash-object -w <file>`**: Hashes a file, compresses it, and stores it as a blob in `.git/objects`.
+* **`ls-tree --name-only <sha>`**: Parses a Tree object and lists the file names contained within.
+* **`write-tree`**: Recursively scans the current directory and creates a Tree object (snapshot).
+* **`commit-tree`**: Creates a Commit object pointing to a Tree and a Parent Commit.
+* **`clone <url> <dir>`**: Clones a public repository. This includes:
+    * Performing the HTTP handshake (Discovery & Negotiation).
+    * Downloading the binary **Packfile**.
+    * Parsing variable-length integers and binary headers.
+    * **Delta Resolution**: Reconstructing files from `OBJ_REF_DELTA` and `OBJ_OFS_DELTA` diffs.
 
-```sh
-git commit -am "pass 1st stage" # any msg
-git push origin master
+## 🛠️ Prerequisites & Dependencies
+
+To build and run this project, you need:
+
+1.  **C++ Compiler** (g++ or clang++) supporting C++17 via `<filesystem>`.
+2.  **Zlib**: For compressing/decompressing Git objects (`-lz`).
+3.  **OpenSSL**: For SHA-1 hashing (`-lcrypto` or `-lssl`).
+4.  **Curl (CLI)**: The program uses `system("curl ...")` for network requests. Ensure `curl` is installed and in your PATH.
+
+## ⚙️ Building
+
+Compile the project using `g++`. You must link against `zlib` and `libcrypto`.
+
+```bash
+g++ -o git main.cpp -lz -lcrypto
 ```
-
-That's all!
-
-# Stage 2 & beyond
-
-Note: This section is for stages 2 and beyond.
-
-1. Ensure you have `cmake` installed locally
-1. Run `./your_program.sh` to run your Git implementation, which is implemented
-   in `src/main.cpp`.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
-
-# Testing locally
-
-The `your_program.sh` script is expected to operate on the `.git` folder inside
-the current working directory. If you're running this inside the root of this
-repository, you might end up accidentally damaging your repository's `.git`
-folder.
-
-We suggest executing `your_program.sh` in a different folder when testing
-locally. For example:
-
-```sh
-mkdir -p /tmp/testing && cd /tmp/testing
-/path/to/your/repo/your_program.sh init
+## 📖 Usage
+### 1. Initialize a Repository
+```Bash
+./git init
 ```
+### 2. Hash & Write a File
+Stores a file in the Git database and returns its SHA-1 hash.
 
-To make this easier to type out, you could add a
-[shell alias](https://shapeshed.com/unix-alias/):
-
-```sh
-alias mygit=/home/asus/Desktop/DTU/SEM VI/codecrafters-git-cpp/your_program.sh
-
-mkdir -p ./tmp/testing && cd ./tmp/testing
-mygit init
+```Bash
+./git hash-object -w <filename>
 ```
+### 3. Read an Object
+Prints the contents of a blob object.
+
+```Bash
+./git cat-file -p <blob_sha>
+```
+### 4. Write a Tree (Snapshot)
+Captures the current directory structure as a Git Tree object.
+
+```Bash
+./git write-tree
+```
+### 5. Create a Commit
+Creates a commit using a Tree SHA and a Parent Commit SHA.
+
+```Bash
+./git commit-tree <tree_sha> -p <parent_sha> -m "Commit message"
+```
+### 6. Clone a Repository
+Downloads a repository from a remote URL into a target directory.
+
+```Bash
+./git clone <url> <target_directory>
+```
+### 🧩 Architecture Notes
+
+#### The Clone Implementation
+The `clone` command is the most complex part of this project. Instead of relying on high-level libraries like `libgit2`, this solution manually implements the **Git Smart HTTP Protocol** to interact directly with the remote server.
+
+1.  **Discovery (Handshake)**
+    * Sends a `GET` request to `/info/refs?service=git-upload-pack`.
+    * Parses the response to find the SHA-1 hash of `HEAD` (the current state of the remote repository).
+
+2.  **Negotiation**
+    * Constructs a custom "want" packet requesting the specific `HEAD` commit.
+    * Sends a `POST` request to `/git-upload-pack`.
+    * *Note:* Capabilities like `no-progress` are excluded to keep the implementation minimal and compliant with simple server responses.
+
+3.  **Packfile Parsing**
+    * Reads the binary **Packfile** stream from the response.
+    * Validates the 12-byte header: `PACK` signature, version number, and object count.
+    * Decompresses the stream of Git objects using Zlib.
+
+4.  **Delta Patching**
+    * Git optimizes bandwidth by sending "deltas" (binary diffs) for similar files instead of full copies.
+    * **Strategy**:
+        * Buffers all received objects in memory.
+        * Iteratively resolves `OBJ_REF_DELTA` and `OBJ_OFS_DELTA` objects.
+        * Applies binary patch instructions (Copy/Insert) against base objects until every file is fully reconstructed and ready for checkout.
