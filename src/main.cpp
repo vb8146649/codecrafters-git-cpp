@@ -3,16 +3,65 @@
 #include <fstream>
 #include <string>
 #include <vector>
-#include <zlib.h> // Required for decompression
-#include <openssl/sha.h> // Required for SHA1
+#include <zlib.h>
+#include <openssl/sha.h>
 #include <sstream>
 #include <iomanip>
+#include <algorithm> // for find
 
 using namespace std;
 
+// Helper: Decompress a git object from .git/objects given its SHA
+string readObject(const string& sha) {
+    string dirName = sha.substr(0, 2);
+    string fileName = sha.substr(2);
+    filesystem::path filePath = ".git/objects/" + dirName + "/" + fileName;
+
+    if (!filesystem::exists(filePath)) {
+        throw runtime_error("Object not found: " + sha);
+    }
+
+    ifstream file(filePath, ios::binary);
+    if (!file.is_open()) {
+        throw runtime_error("Failed to open object file: " + sha);
+    }
+
+    vector<char> compressedData((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
+    file.close();
+
+    z_stream zs;
+    zs.zalloc = Z_NULL;
+    zs.zfree = Z_NULL;
+    zs.opaque = Z_NULL;
+    zs.avail_in = compressedData.size();
+    zs.next_in = reinterpret_cast<Bytef*>(compressedData.data());
+
+    if (inflateInit(&zs) != Z_OK) {
+        throw runtime_error("Failed to initialize zlib.");
+    }
+
+    vector<char> buffer(8192);
+    string decompressed;
+    int ret;
+
+    do {
+        zs.avail_out = buffer.size();
+        zs.next_out = reinterpret_cast<Bytef*>(buffer.data());
+
+        ret = inflate(&zs, Z_NO_FLUSH);
+
+        if (decompressed.size() < zs.total_out) {
+            decompressed.append(buffer.data(), zs.total_out - decompressed.size());
+        }
+
+    } while (ret != Z_STREAM_END);
+
+    inflateEnd(&zs);
+    return decompressed;
+}
+
 int main(int argc, char *argv[])
 {
-    // Flush after every cout / cerr
     cout << unitbuf;
     cerr << unitbuf;
 
@@ -49,140 +98,98 @@ int main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
 
-        string blob_sha = argv[3];
-        
-        // 1. Construct the path to the object file
-        // Git stores objects in .git/objects/xx/yyyyyyyy...
-        string dirName = blob_sha.substr(0, 2);
-        string fileName = blob_sha.substr(2);
-        filesystem::path filePath = ".git/objects/" + dirName + "/" + fileName;
-
-        if (!filesystem::exists(filePath)) {
-            cerr << "Object not found: " << blob_sha << endl;
-            return EXIT_FAILURE;
-        }
-
-        // 2. Read the compressed file contents
-        ifstream file(filePath, ios::binary);
-        if (!file.is_open()) {
-            cerr << "Failed to open object file." << endl;
-            return EXIT_FAILURE;
-        }
-        
-        // Read the entire file into a vector
-        vector<char> compressedData((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
-        file.close();
-
-        // 3. Decompress using Zlib
-        // Initialize zlib stream
-        z_stream zs;
-        zs.zalloc = Z_NULL;
-        zs.zfree = Z_NULL;
-        zs.opaque = Z_NULL;
-        zs.avail_in = compressedData.size();
-        zs.next_in = reinterpret_cast<Bytef*>(compressedData.data());
-
-        if (inflateInit(&zs) != Z_OK) {
-            cerr << "Failed to initialize zlib." << endl;
-            return EXIT_FAILURE;
-        }
-
-        // Buffer for decompressed data (we'll resize string dynamically)
-        vector<char> buffer(8192);
-        string decompressed;
-        int ret;
-
-        // Inflate loop
-        do {
-            zs.avail_out = buffer.size();
-            zs.next_out = reinterpret_cast<Bytef*>(buffer.data());
-
-            ret = inflate(&zs, Z_NO_FLUSH);
-
-            if (decompressed.size() < zs.total_out) {
-                decompressed.append(buffer.data(), zs.total_out - decompressed.size());
+        try {
+            string content = readObject(argv[3]);
+            // Find null byte separating header from content
+            size_t nullPos = content.find('\0');
+            if (nullPos == string::npos) {
+                cerr << "Invalid object format." << endl;
+                return EXIT_FAILURE;
             }
-
-        } while (ret != Z_STREAM_END);
-
-        inflateEnd(&zs);
-
-        // 4. Parse the header: "blob <size>\0<content>"
-        // Find the first null byte which separates header from content
-        size_t nullPos = decompressed.find('\0');
-        if (nullPos == string::npos) {
-            cerr << "Invalid blob format." << endl;
+            cout << content.substr(nullPos + 1);
+        } catch (const exception& e) {
+            cerr << e.what() << endl;
             return EXIT_FAILURE;
         }
-
-        // Extract and print content
-        // We use string view or substring. Note: print strictly to stdout.
-        string content = decompressed.substr(nullPos + 1);
-        cout << content;
 
     } else if (command == "hash-object") {
+        // ... (Your hash-object code remains exactly the same) ...
         if (argc < 4 || string(argv[2]) != "-w") {
             cerr << "Usage: hash-object -w <file_path>\n";
             return EXIT_FAILURE;
         }
-
         string file_path = argv[3];
-        
-        // Read file content
         ifstream file(file_path, ios::binary);
-        if (!file.is_open()) {
-            cerr << "Failed to open file: " << file_path << endl;
-            return EXIT_FAILURE;
-        }
-        
+        if (!file.is_open()) { cerr << "Failed to open file." << endl; return EXIT_FAILURE; }
         vector<char> fileData((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
         file.close();
 
-        // Create blob header
         string header = "blob " + to_string(fileData.size()) + '\0';
-        // Full data to hash
         string fullData = header + string(fileData.begin(), fileData.end());
 
-        // Compute SHA-1 hash
         unsigned char hash[20];
         SHA1(reinterpret_cast<const unsigned char*>(fullData.data()), fullData.size(), hash);
 
-        // Convert hash to hex string
         stringstream ss;
-        for (int i = 0; i < 20; ++i) {
-            ss << hex << setw(2) << setfill('0') << (int)hash[i];
-        }
+        for (int i = 0; i < 20; ++i) ss << hex << setw(2) << setfill('0') << (int)hash[i];
         string sha1 = ss.str();
 
-        // Compress the data using zlib
         uLongf compressedSize = compressBound(fullData.size());
         vector<Bytef> compressedData(compressedSize);
-
         if (compress(compressedData.data(), &compressedSize, reinterpret_cast<const Bytef*>(fullData.data()), fullData.size()) != Z_OK) {
-            cerr << "Compression failed." << endl;
-            return EXIT_FAILURE;
+             cerr << "Compression failed." << endl; return EXIT_FAILURE; 
         }
 
-        // Store the object in .git/objects/xx/yyyyyyyy...
         string dirName = sha1.substr(0, 2);
         string fileName = sha1.substr(2);
-        filesystem::path objectDir = ".git/objects/" + dirName;
+        filesystem::create_directories(".git/objects/" + dirName);
+        ofstream objectFile(".git/objects/" + dirName + "/" + fileName, ios::binary);
+        objectFile.write(reinterpret_cast<const char*>(compressedData.data()), compressedSize);
+        objectFile.close();
+        cout << sha1 << endl;
 
-        // Create directory if it doesn't exist
-        filesystem::create_directories(objectDir);
-
-        filesystem::path objectPath = objectDir / fileName;
-        ofstream objectFile(objectPath, ios::binary);
-        if (!objectFile.is_open()) {
-            cerr << "Failed to create object file." << endl;
+    } else if (command == "ls-tree") {
+        if (argc < 4 || string(argv[2]) != "--name-only") {
+            cerr << "Usage: ls-tree --name-only <tree_sha>\n";
             return EXIT_FAILURE;
         }
 
-        objectFile.write(reinterpret_cast<const char*>(compressedData.data()), compressedSize);
-        objectFile.close();
+        string tree_sha = argv[3];
+        try {
+            string content = readObject(tree_sha);
+            
+            // 1. Skip the header "tree <size>\0"
+            size_t headerEnd = content.find('\0');
+            if (headerEnd == string::npos) return EXIT_FAILURE;
+            
+            // i points to the start of the first entry
+            size_t i = headerEnd + 1; 
 
-        // Output the SHA-1 hash
-        cout << sha1 << endl;
+            // Loop until we run out of data
+            while (i < content.size()) {
+                // Format: <mode> <name>\0<20_byte_sha>
+                
+                // 2. Find the space after mode (we ignore mode for now)
+                size_t spacePos = content.find(' ', i);
+                if (spacePos == string::npos) break;
+
+                // 3. Find the null byte after name
+                size_t nullPos = content.find('\0', spacePos);
+                if (nullPos == string::npos) break;
+
+                // Extract name
+                string name = content.substr(spacePos + 1, nullPos - (spacePos + 1));
+                cout << name << endl;
+
+                // 4. Advance past the null byte AND the 20-byte SHA
+                // The SHA is exactly 20 bytes long
+                i = nullPos + 1 + 20;
+            }
+        } catch (const exception& e) {
+            cerr << e.what() << endl;
+            return EXIT_FAILURE;
+        }
+
     } else {
         cerr << "Unknown command " << command << '\n';
         return EXIT_FAILURE;
