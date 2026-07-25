@@ -5,6 +5,10 @@
 #include <vector>
 #include <zlib.h>
 #include <openssl/sha.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/err.h>
 #include <sstream>
 #include <iomanip>
 #include <algorithm> // Required for sorting
@@ -333,6 +337,156 @@ void checkoutRecursive(const string& treeSha, const fs::path& dir) {
 
 // //
 
+// --- Cryptographic Signing & Verification Helpers ---
+
+bool generateKeyPair(const string& privateKeyPath, const string& publicKeyPath) {
+    EVP_PKEY* pkey = nullptr;
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
+    if (!ctx) return false;
+
+    if (EVP_PKEY_keygen_init(ctx) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return false;
+    }
+
+    if (EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return false;
+    }
+
+    if (EVP_PKEY_keygen(ctx, &pkey) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return false;
+    }
+    EVP_PKEY_CTX_free(ctx);
+
+    // Write private key to file
+    BIO* priBio = BIO_new_file(privateKeyPath.c_str(), "w");
+    if (!priBio) {
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+    if (!PEM_write_bio_PrivateKey(priBio, pkey, nullptr, nullptr, 0, nullptr, nullptr)) {
+        EVP_PKEY_free(pkey);
+        BIO_free(priBio);
+        return false;
+    }
+    BIO_free(priBio);
+
+    // Write public key to file
+    BIO* pubBio = BIO_new_file(publicKeyPath.c_str(), "w");
+    if (!pubBio) {
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+    if (!PEM_write_bio_PUBKEY(pubBio, pkey)) {
+        EVP_PKEY_free(pkey);
+        BIO_free(pubBio);
+        return false;
+    }
+    BIO_free(pubBio);
+
+    EVP_PKEY_free(pkey);
+    return true;
+}
+
+bool signHash(const unsigned char* hash, size_t hashLen, const string& privateKeyPath, string& signatureHex) {
+    BIO* bio = BIO_new_file(privateKeyPath.c_str(), "r");
+    if (!bio) return false;
+
+    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    if (!pkey) return false;
+
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+    if (!ctx) {
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
+    if (EVP_PKEY_sign_init(ctx) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
+    if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
+    size_t sigLen = 0;
+    if (EVP_PKEY_sign(ctx, nullptr, &sigLen, hash, hashLen) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
+    vector<unsigned char> sig(sigLen);
+    if (EVP_PKEY_sign(ctx, sig.data(), &sigLen, hash, hashLen) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
+    stringstream ss;
+    for (unsigned char c : sig) {
+        ss << hex << setw(2) << setfill('0') << (int)c;
+    }
+    signatureHex = ss.str();
+
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return true;
+}
+
+vector<unsigned char> hexToBytes(const string& hexStr) {
+    vector<unsigned char> bytes;
+    for (size_t i = 0; i < hexStr.length(); i += 2) {
+        string byteString = hexStr.substr(i, 2);
+        unsigned char byte = (unsigned char) strtol(byteString.c_str(), nullptr, 16);
+        bytes.push_back(byte);
+    }
+    return bytes;
+}
+
+bool verifySignature(const unsigned char* hash, size_t hashLen, const string& signatureHex, const string& publicKeyPath) {
+    vector<unsigned char> sig = hexToBytes(signatureHex);
+
+    BIO* bio = BIO_new_file(publicKeyPath.c_str(), "r");
+    if (!bio) return false;
+
+    EVP_PKEY* pkey = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    if (!pkey) return false;
+
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+    if (!ctx) {
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
+    if (EVP_PKEY_verify_init(ctx) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
+    if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
+    int ret = EVP_PKEY_verify(ctx, sig.data(), sig.size(), hash, hashLen);
+
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+
+    return ret == 1;
+}
+
 // --- Main ---
 
 int main(int argc, char *argv[])
@@ -388,52 +542,190 @@ int main(int argc, char *argv[])
             cout << shaToHex(rawSha) << endl;
 
         } else if (command == "commit-tree") {
-            // Usage: commit-tree <tree_sha> -p <parent_sha> -m <message>
-            // Note: -p <parent_sha> is optional or variable position
-            
+            // Usage: commit-tree <tree_sha> -p <parent_sha> -m <message> [--sign <private_key_path>]
             if (argc < 4) {
-                cerr << "Usage: commit-tree <tree_sha> -m <message> [-p <parent_sha>]\n";
+                cerr << "Usage: commit-tree <tree_sha> -m <message> [-p <parent_sha>] [--sign <private_key_path>]\n";
                 return EXIT_FAILURE;
             }
 
             string tree_sha = argv[2];
             string parent_sha;
             string message;
+            string signKeyPath;
 
-            // Simple argument parsing loop to handle flags (-p, -m)
             for (int i = 3; i < argc; ++i) {
                 string arg = argv[i];
                 if (arg == "-p" && i + 1 < argc) {
                     parent_sha = argv[++i];
                 } else if (arg == "-m" && i + 1 < argc) {
                     message = argv[++i];
+                } else if (arg == "--sign" && i + 1 < argc) {
+                    signKeyPath = argv[++i];
                 }
             }
 
+            if (signKeyPath.empty() && fs::exists(".git/private_key.pem")) {
+                signKeyPath = ".git/private_key.pem";
+            }
+
             stringstream ss;
-            // 1. Tree SHA
             ss << "tree " << tree_sha << "\n";
-            
-            // 2. Parent SHA (if present)
             if (!parent_sha.empty()) {
                 ss << "parent " << parent_sha << "\n";
             }
-            
-            // 3. Author & Committer
-            // Hardcoded as permitted by the challenge requirements
             string authorLine = "author Code Crafter <code@crafters.io> 1700000000 +0000";
             string committerLine = "committer Code Crafter <code@crafters.io> 1700000000 +0000";
-
             ss << authorLine << "\n";
             ss << committerLine << "\n";
-            ss << "\n"; // Blank line is required between header and message
-            
-            // 4. Message
+            ss << "\n";
             ss << message << "\n";
 
-            // Write the commit object using the generic helper
-            string rawSha = writeObject("commit", ss.str());
+            string commit_content = ss.str();
+
+            if (!signKeyPath.empty()) {
+                unsigned char hash[SHA256_DIGEST_LENGTH];
+                SHA256(reinterpret_cast<const unsigned char*>(commit_content.data()), commit_content.size(), hash);
+
+                string signatureHex;
+                if (signHash(hash, SHA256_DIGEST_LENGTH, signKeyPath, signatureHex)) {
+                    stringstream signed_ss;
+                    signed_ss << "tree " << tree_sha << "\n";
+                    if (!parent_sha.empty()) {
+                        signed_ss << "parent " << parent_sha << "\n";
+                    }
+                    signed_ss << authorLine << "\n";
+                    signed_ss << committerLine << "\n";
+                    signed_ss << "gpgsig " << signatureHex << "\n";
+                    signed_ss << "\n";
+                    signed_ss << message << "\n";
+                    commit_content = signed_ss.str();
+                } else {
+                    cerr << "[ERROR] Failed to sign commit using key: " << signKeyPath << "\n";
+                    return EXIT_FAILURE;
+                }
+            }
+
+            string rawSha = writeObject("commit", commit_content);
             cout << shaToHex(rawSha) << endl;
+
+        } else if (command == "keygen" || command == "generate-keys") {
+            string outputDir = ".git";
+            if (argc >= 3) {
+                outputDir = argv[2];
+            }
+
+            if (!fs::exists(outputDir)) {
+                fs::create_directories(outputDir);
+            }
+
+            string privateKeyPath = (fs::path(outputDir) / "private_key.pem").string();
+            string publicKeyPath = (fs::path(outputDir) / "public_key.pem").string();
+
+            if (generateKeyPair(privateKeyPath, publicKeyPath)) {
+                cout << "Keys generated successfully!\n";
+                cout << "Private Key: " << privateKeyPath << "\n";
+                cout << "Public Key: " << publicKeyPath << "\n";
+                return EXIT_SUCCESS;
+            } else {
+                cerr << "Failed to generate keys!\n";
+                return EXIT_FAILURE;
+            }
+
+        } else if (command == "verify-commit") {
+            if (argc < 3) {
+                cerr << "Usage: verify-commit <commit_sha> [--key <public_key_path>]\n";
+                return EXIT_FAILURE;
+            }
+
+            string commit_sha = argv[2];
+            string publicKeyPath;
+
+            for (int i = 3; i < argc; ++i) {
+                string arg = argv[i];
+                if (arg == "--key" && i + 1 < argc) {
+                    publicKeyPath = argv[++i];
+                }
+            }
+
+            string commitObj = readObject(commit_sha);
+            size_t nullPos = commitObj.find('\0');
+            if (nullPos == string::npos) {
+                cerr << "[ERROR] Invalid commit object format.\n";
+                return EXIT_FAILURE;
+            }
+            string commitContent = commitObj.substr(nullPos + 1);
+
+            vector<string> headers;
+            string signatureHex;
+            string message;
+            bool inHeaders = true;
+            size_t pos = 0;
+
+            while (pos < commitContent.size()) {
+                size_t nextNL = commitContent.find('\n', pos);
+                if (nextNL == string::npos) {
+                    string line = commitContent.substr(pos);
+                    if (inHeaders) {
+                        if (line.empty()) {
+                            inHeaders = false;
+                        } else if (line.rfind("gpgsig ", 0) == 0) {
+                            signatureHex = line.substr(7);
+                        } else {
+                            headers.push_back(line);
+                        }
+                    } else {
+                        message += line;
+                    }
+                    break;
+                }
+                string line = commitContent.substr(pos, nextNL - pos);
+                pos = nextNL + 1;
+
+                if (inHeaders) {
+                    if (line.empty()) {
+                        inHeaders = false;
+                    } else if (line.rfind("gpgsig ", 0) == 0) {
+                        signatureHex = line.substr(7);
+                    } else {
+                        headers.push_back(line);
+                    }
+                } else {
+                    message += line + "\n";
+                }
+            }
+
+            if (signatureHex.empty()) {
+                cout << "Error: Commit is not signed.\n";
+                return EXIT_FAILURE;
+            }
+
+            if (publicKeyPath.empty()) {
+                if (fs::exists(".git/public_key.pem")) {
+                    publicKeyPath = ".git/public_key.pem";
+                } else {
+                    cerr << "[ERROR] Public key file not specified and default .git/public_key.pem not found.\n";
+                    return EXIT_FAILURE;
+                }
+            }
+
+            stringstream unsigned_ss;
+            for (const auto& h : headers) {
+                unsigned_ss << h << "\n";
+            }
+            unsigned_ss << "\n";
+            unsigned_ss << message;
+            string unsignedContent = unsigned_ss.str();
+
+            unsigned char hash[SHA256_DIGEST_LENGTH];
+            SHA256(reinterpret_cast<const unsigned char*>(unsignedContent.data()), unsignedContent.size(), hash);
+
+            if (verifySignature(hash, SHA256_DIGEST_LENGTH, signatureHex, publicKeyPath)) {
+                cout << "Signature is valid. Commit is authentic.\n";
+                return EXIT_SUCCESS;
+            } else {
+                cout << "Verification failed! Commit has been tampered with.\n";
+                return EXIT_FAILURE;
+            }
 
         } else if (command == "clone") {
             if (argc < 4) return EXIT_FAILURE;
